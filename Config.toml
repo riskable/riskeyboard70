@@ -1,0 +1,70 @@
+[keyboard]
+# How far (in millivolts) a key needs to move down before it's considered pressed
+actuation_threshold = 125 # 50-800 or so. Just a default (you can change it on-the-fly)
+# How far it needs to move back up before it's considered released
+release_threshold = 75 # 50-250 or so; Prevents bouncing
+# Number of analog multiplexers on this keyboard
+num_multiplexers = 5
+# Maximum number of channels on each multiplexer/remote control
+max_channels = 21 # Multiplexers are always 16 but my remote has 21 buttons 🤷
+# USB identifiers (these are for a generic keyboard)
+usb_vid = 0x16c0
+usb_pid = 0x27db
+# So we don't bother with disconnected pins, all mV values below this are ignored
+ignore_below = 1200 # Probably leave this alone; just saves a smidge of CPU time
+# Don't touch keyboard stuff below this point unless you know what you're doing
+update_defaults_rate = 1 # Updates per second
+
+# Rotary encoder settings (TODO: Figure out how to support multiple encoders)
+[encoder]
+# Controls how many mV either sensor needs to go up/down before we consider that a movement
+resolution = 450 # Valid values are 50-750-ish; below 200 or so can be annoying IMHO
+# mV difference where we call it a Press()
+press_threshold = 600 # Must be greater than resolution
+# The analog multiplexer where the encoder lives
+mux = 4
+# The channels on the analog multiplexer where the encoder sensors reside
+channel1 = 8
+channel2 = 9
+# The virtual channel (doesn't actually exist) where we define encoder Press() events
+press_channel = 10
+
+# Settings related to when we emulate a mouse (i.e. for scrolling with the rotary encoder)
+[mouse]
+# How many "units" (aka "lines") to scroll per press/registered rotation
+scroll_amount = 2
+
+[leds]
+# How many LEDs are there? Normally there's 72 (70 keys + two under the encoder)
+# but if your keyboard is controlling external LEDs you'll need to factor that into
+# this number.
+num_leds = 150
+brightness = 50 # 0-255; for values over 50 you're going to need external power
+step = 5 # How much to move (±) when adjusting the LED brightness
+# speed = 15000000 # The speed at which LED effects move
+speed = 50 # The speed at which LED effects move
+
+[display]
+num_matrices = 8
+brightness = 1
+buffer_length = 50
+refresh_interval = 15 # FPS
+vertical_flip = 1
+mirror = 0
+
+[infrared]
+# Encoding method used by your remote control
+encoding = 0 # 0: Nec, 1: Rc5, 2: Rc6
+# Imaginary analog multiplexer that comes after all the real ones
+mux = 5 # Just a location in the layers.rs where you can map buttons to actions
+# TODO: Figure out a way to map remote buttons here instead of in ir_remote.rs
+# These map to the portion of layers.rs that maps to IR codes
+# codemap = [
+#     [0,76],
+#     [0,77],
+# ]
+
+# Developer-only stuff
+[dev]
+# Max speed (ms) at which we'll send (recurring) debug messages through the ST-LINK pins
+debug_refresh_interval = 250
