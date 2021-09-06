@@ -1,8 +1,8 @@
 [keyboard]
 # How far (in millivolts) a key needs to move down before it's considered pressed
-actuation_threshold = 125 # 50-800 or so. Just a default (you can change it on-the-fly)
+actuation_threshold = 100 # 50-800 or so. Just a default (you can change it on-the-fly)
 # How far it needs to move back up before it's considered released
-release_threshold = 75 # 50-250 or so; Prevents bouncing
+release_threshold = 50 # 50-250 or so; Prevents bouncing
 # Number of analog multiplexers on this keyboard
 num_multiplexers = 5
 # Maximum number of channels on each multiplexer/remote control
@@ -11,14 +11,14 @@ max_channels = 21 # Multiplexers are always 16 but my remote has 21 buttons 🤷
 usb_vid = 0x16c0
 usb_pid = 0x27db
 # So we don't bother with disconnected pins, all mV values below this are ignored
-ignore_below = 1200 # Probably leave this alone; just saves a smidge of CPU time
+ignore_below = 600 # Probably leave this alone; just saves a smidge of CPU time
 # Don't touch keyboard stuff below this point unless you know what you're doing
 update_defaults_rate = 1 # Updates per second
 
 # Rotary encoder settings (TODO: Figure out how to support multiple encoders)
 [encoder]
 # Controls how many mV either sensor needs to go up/down before we consider that a movement
-resolution = 450 # Valid values are 50-750-ish; below 200 or so can be annoying IMHO
+resolution = 240 # Valid values are 50-750-ish; below 200 or so can be annoying IMHO
 # mV difference where we call it a Press()
 press_threshold = 600 # Must be greater than resolution
 # The analog multiplexer where the encoder lives
@@ -39,7 +39,7 @@ scroll_amount = 2
 # but if your keyboard is controlling external LEDs you'll need to factor that into
 # this number.
 num_leds = 150
-brightness = 50 # 0-255; for values over 50 you're going to need external power
+brightness = 30 # 0-255; for values over 30 you're going to need external power
 step = 5 # How much to move (±) when adjusting the LED brightness
 # speed = 15000000 # The speed at which LED effects move
 speed = 50 # The speed at which LED effects move
