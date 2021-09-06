@@ -3,7 +3,6 @@
 
 use font8x8::UnicodeFonts;
 use heapless::Vec; // fixed capacity `std::Vec`
-use heapless::consts::{U512,U8}; // type level integer used to specify capacity
 extern crate font8x8;
 use crate::config;
 use crate::aliases::MAX7219Display;
@@ -11,12 +10,9 @@ use crate::aliases::MAX7219Display;
 /// Holds our display buffer which is the number of matrices times 2
 pub struct Display<'a, const BUFFER_LENGTH: usize> { // I love const generics!
     pub num_matrices: usize, // Max 8 right now because of the limiations of the max7219 crate
-    pub buffer: Vec<[u8; 8], U512>,
-    // FUTURE: When const generics are stable and heapless supports it:
-    // pub buffer: Vec<[u8; 8], BUFFER_LENGTH>,
-    // pub buffer: [[u8; 8]; BUFFER_LENGTH], // Old, non-heapless::Vec way (for reference)
+    pub buffer: Vec<[u8; 8], BUFFER_LENGTH>, // Hurray for const generics!
     display: MAX7219Display,
-    messages: Vec<Message<'a>, U8>,
+    messages: Vec<Message<'a>, 256>,
 }
 
 /// A container for text that gets moved to the display
@@ -46,7 +42,8 @@ impl<'a, const BUFFER_LENGTH: usize> Display<'a, BUFFER_LENGTH> {
             let _ = self.display.clear_display(d);
             self.display.set_intensity(d, config::DISPLAY_BRIGHTNESS).unwrap();
         }
-        self.write_str("=) TYPE TYPE TYPE =) «» ");
+        self.write_str("Riskeyboard 70   ");
+        // self.write_str("=) TYPE TYPE TYPE =) «» ");
         self.sync();
     }
 

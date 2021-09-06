@@ -5,8 +5,9 @@ use analog_multiplexer::{DummyPin, Multiplexer};
 use max7219::connectors::PinConnector;
 use max7219::MAX7219;
 use spi_memory::series25::Flash;
-use stm32f4xx_hal::gpio::gpioa::{PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PA8, PA9, PA10};
-use stm32f4xx_hal::gpio::gpiob::{PB0, PB1, PB3, PB4, PB5, PB8, PB9, PB12, PB13, PB14, PB15};
+use stm32f4xx_hal::gpio::gpioa::{PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PA8, PA9, PA10, PA15};
+use stm32f4xx_hal::gpio::gpiob::{PB0, PB1, PB3, PB4, PB5, PB8, PB9, PB12};
+use stm32f4xx_hal::gpio::gpioc::{PC13};
 use stm32f4xx_hal::gpio::{Alternate, Analog, Floating, Input, Output, PushPull, AF5, AF6};
 use stm32f4xx_hal::otg_fs::{UsbBus, UsbBusType, USB};
 use stm32f4xx_hal::spi::{NoMiso, NoSck, Spi};
@@ -29,10 +30,10 @@ pub type AnalogPins = (
     PA4<Analog>,
 );
 // Define which pins go to where on your analog multiplexer's select lines
-pub type S0 = PB12<Output<PushPull>>; // These just make things easier to read/reason about
-pub type S1 = PB13<Output<PushPull>>; // aka "very expressive"
-pub type S2 = PB14<Output<PushPull>>;
-pub type S3 = PB15<Output<PushPull>>;
+pub type S0 = PC13<Output<PushPull>>; // These just make things easier to read/reason about
+pub type S1 = PB8<Output<PushPull>>; // aka "very expressive"
+pub type S2 = PB12<Output<PushPull>>;
+pub type S3 = PA15<Output<PushPull>>;
 pub type EN = DummyPin; // NOTE: We assume the enable pin goes to GND at all times
 
 // Relay pin

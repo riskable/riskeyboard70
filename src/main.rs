@@ -49,7 +49,7 @@ use rtic::app;
 use rtic::cyccnt::U32Ext as _;
 use rtt_target::{rtt_init, UpChannel};
 use stm32f4xx_hal::adc::{config::AdcConfig, config::SampleTime, Adc};
-use stm32f4xx_hal::gpio::gpioa::PA15;
+use stm32f4xx_hal::gpio::gpiob::PB15;
 use stm32f4xx_hal::{adc::config::Clock, time::MegaHertz};
 // use stm32f4xx_hal::{pwm, time::MegaHertz};
 // use stm32f4xx_hal::gpio::gpioc::PC13;
@@ -116,7 +116,7 @@ type UsbKeyClass = keyberon::Class<'static, UsbBusType, Leds>;
 
 // This is a numpad with the Black Pill at the top so we'll use the built-in LED for Numlock:
 pub struct Leds {
-    num_lock: PA15<Output<PushPull>>, // NOTE: PA15 is just a temp unused pin!
+    num_lock: PB15<Output<PushPull>>, // NOTE: PB15 is just a temp unused pin!
 }
 impl keyberon::keyboard::Leds for Leds {
     fn num_lock(&mut self, status: bool) {
@@ -150,9 +150,9 @@ const APP: () = {
         // display_timer: timer::Timer<stm32::TIM4>,
         ir_timer: timer::Timer<stm32::TIM2>,
         ir_button: u8, // Anything > 254 is considered, "nothing pressed"
-        relay1: aliases::RELAY1,
-        relay2: aliases::RELAY2,
-        relay3: aliases::RELAY3,
+        // relay1: aliases::RELAY1,
+        // relay2: aliases::RELAY2,
+        // relay3: aliases::RELAY3,
         adc: Adc<ADC1>,
         clocks: stm32f4xx_hal::rcc::Clocks,
         analog_pins: aliases::AnalogPins,
@@ -284,23 +284,24 @@ const APP: () = {
         // So we can use GPIOs...
         let gpioa = c.device.GPIOA.split();
         let gpiob = c.device.GPIOB.split();
-        // let gpioc = c.device.GPIOC.split();
+        let gpioc = c.device.GPIOC.split();
 
         // TEMP: Set PC13 to (floating input, pull down/up input == flicker)
         // into_open_drain_output, into_push_pull_output == broken (no updates to LEDs)
         // let _temp_pc13 = gpioc.pc13.into_open_drain_output();
 
-        // Power detection input
-        let ext_power = gpiob.pb10.into_floating_input();
+        // Power detection input (if barrel jack is connected it will show as high)
+        let ext_power = gpiob.pb10.into_pull_up_input();
 
-        // Relay pins
-        let mut relay1 = gpiob.pb1.into_push_pull_output();
-        let mut relay2 = gpioa.pa9.into_push_pull_output();
-        let mut relay3 = gpioa.pa10.into_push_pull_output();
-        // Relay activates on low so we set high by default:
-        let _ = relay1.set_high();
-        let _ = relay2.set_high();
-        let _ = relay3.set_high();
+        // Temporarily disabled relays while I figure out how to handle them better
+        // // Relay pins
+        // let mut relay1 = gpiob.pb1.into_push_pull_output(); // NOTE: This is the buzzer pin
+        // let mut relay2 = gpioa.pa9.into_push_pull_output();
+        // let mut relay3 = gpioa.pa10.into_push_pull_output();
+        // // Relay activates on low so we set high by default:
+        // let _ = relay1.set_high();
+        // let _ = relay2.set_high();
+        // let _ = relay3.set_high();
 
 
         // Infrared LED
@@ -403,7 +404,7 @@ const APP: () = {
         // );
         let mut ws = Ws2812::new(spi);
         let led_brightness_saved = config::LEDS_BRIGHTNESS;
-        // Make the LEDs off by default
+        // Make the LEDs off for startup
         let led_data = [RGB8::default(); config::LEDS_NUM_LEDS];
         // let led_data = [colors::WHITE; config::LEDS_NUM_LEDS]; // Make em all white by default
         // for i in 0..config::LEDS_NUM_LEDS {
@@ -421,7 +422,7 @@ const APP: () = {
         // TODO: Change this to indicate caps lock in the right place:
         // Setup our on-board LED to indicate Caps Lock
         // NOTE: Disabled the Keyberon LED control feature until I figure out how to get it working with ws2812
-        let mut led = gpioa.pa15.into_push_pull_output();
+        let mut led = gpiob.pb15.into_push_pull_output();
         led.set_low().unwrap();
         let leds = Leds { num_lock: led };
 
@@ -443,10 +444,10 @@ const APP: () = {
         let pa4 = gpioa.pa4.into_analog();
         let analog_pins = (pa0, pa1, pa2, pa3, pa4);
         // Setup PB12-PB15 for accessing S0-S3 on the 74HC4067 multiplexers
-        let s0 = gpiob.pb12.into_push_pull_output();
-        let s1 = gpiob.pb13.into_push_pull_output();
-        let s2 = gpiob.pb14.into_push_pull_output();
-        let s3 = gpiob.pb15.into_push_pull_output();
+        let s0 = gpioc.pc13.into_push_pull_output();
+        let s1 = gpiob.pb8.into_push_pull_output();
+        let s2 = gpiob.pb12.into_push_pull_output();
+        let s3 = gpioa.pa15.into_push_pull_output();
         let en = DummyPin; // Just run it to GND to keep always-enabled
         let select_pins = (s0, s1, s2, s3, en);
 
@@ -472,7 +473,7 @@ const APP: () = {
         let usb_vid_pid = UsbVidPid(config::KEYBOARD_USB_VID, config::KEYBOARD_USB_PID);
         let usb_key_dev = UsbDeviceBuilder::new(usb_bus, usb_vid_pid)
             .manufacturer("Riskable")
-            .product("Riskey Keyboard")
+            .product("Riskeyboard 70")
             // Include a capabilities string (future stuff)
             .serial_number(concat!(env!("CARGO_PKG_VERSION"), " 🖮v1.0:BEEF"))
             .max_power(500) // Pull out as much as we can (for now)!
@@ -579,8 +580,9 @@ const APP: () = {
         // Check the state of the external power connector
         match ext_power.is_high() {
             Ok(result) => {
-                let _ = writeln!(debug_ch0, "ext_power.is_high(): {}", result);
+                let _ = writeln!(debug_ch0, "External Barrel Jack Connected: {}", result);
             }
+        // NOTE: This only detects if a plug is inserted into the barrel jack; it doesn't detect if power is going into it.
             _ => {
                 let _ = writeln!(debug_ch0, "Strange result from ext power check");
             }
@@ -608,7 +610,7 @@ const APP: () = {
             // display_timer,
             ir_timer,
             ir_button,
-            relay1, relay2, relay3,
+            // relay1, relay2, relay3,
             adc,
             clocks,
             analog_pins,
@@ -829,7 +831,8 @@ const APP: () = {
 
     #[task(binds = TIM3, priority = 2, resources = [
         config, debug_msg_counter, usb_keyboard, usb_mouse, layout, multiplexer,
-        led_brightness_saved, rotary_clockwise, ir_button, display, relay1, relay2, relay3,
+        led_brightness_saved, rotary_clockwise, ir_button, display,
+        // relay1, relay2, relay3,
         debug_ch0, debug_ch1, debug_ch2, debug_ch3, debug_ch4, debug_ch5,
         timer, adc, analog_pins, channel_states])]
     fn tick(mut c: tick::Context) {
@@ -858,9 +861,9 @@ const APP: () = {
         let brightness_saved = c.resources.led_brightness_saved;
         let mut ir_button = c.resources.ir_button;
         let display = c.resources.display;
-        let relay1 = c.resources.relay1;
-        let relay2 = c.resources.relay2;
-        let relay3 = c.resources.relay3;
+        // let relay1 = c.resources.relay1;
+        // let relay2 = c.resources.relay2;
+        // let relay3 = c.resources.relay3;
         // let delay = c.resources.delay;
         // let buzzer = c.resources.buzzer;
         // let buzzer_timer = c.resources.buzzer_timer;
@@ -887,7 +890,7 @@ const APP: () = {
                     _ => 0, // Riskeyboard 70 only has 5 multiplexers
                 };
                 let millivolts = adc.sample_to_millivolts(sample);
-                // Record the channel's previous state so we can tell if it's state changed
+                // Record the channel's previous state so we can tell if it's state changed (for relays)
                 let prev_ch_state = ch_states[multi][chan as usize].pressed;
                 // Now record the state of each channel:
                 ch_states[multi][chan as usize].record_value(millivolts);
@@ -906,30 +909,31 @@ const APP: () = {
                 // if ch_states[multi][chan as usize].pressed {
                 //     let _ = writeln!(debug_ch0, "Something's pressed");
                 // }
-                if ch_states[multi][chan as usize].pressed != prev_ch_state {
-                    if relay1.is_high().unwrap() && relay2.is_high().unwrap() && relay3.is_high().unwrap() {
-                        let _ = relay1.set_low(); // Kick things off
-                        continue;
-                    }
-                    if relay1.is_low().unwrap() {
-                        let _ = relay1.set_high();
-                        let _ = relay2.set_low();
-                        let _ = relay3.set_high();
-                        continue;
-                    }
-                    if relay2.is_low().unwrap() {
-                        let _ = relay1.set_high();
-                        let _ = relay2.set_high();
-                        let _ = relay3.set_low();
-                        continue;
-                    }
-                    if relay3.is_low().unwrap() {
-                        let _ = relay1.set_low();
-                        let _ = relay2.set_high();
-                        let _ = relay3.set_high();
-                        continue;
-                    }
-                }
+                // NOTE: Temporarily disabled relay support while I figure out a better way to support them (without using so many pins)
+                // if ch_states[multi][chan as usize].pressed != prev_ch_state {
+                //     if relay1.is_high().unwrap() && relay2.is_high().unwrap() && relay3.is_high().unwrap() {
+                //         let _ = relay1.set_low(); // Kick things off
+                //         continue;
+                //     }
+                //     if relay1.is_low().unwrap() {
+                //         let _ = relay1.set_high();
+                //         let _ = relay2.set_low();
+                //         let _ = relay3.set_high();
+                //         continue;
+                //     }
+                //     if relay2.is_low().unwrap() {
+                //         let _ = relay1.set_high();
+                //         let _ = relay2.set_high();
+                //         let _ = relay3.set_low();
+                //         continue;
+                //     }
+                //     if relay3.is_low().unwrap() {
+                //         let _ = relay1.set_low();
+                //         let _ = relay2.set_high();
+                //         let _ = relay3.set_high();
+                //         continue;
+                //     }
+                // }
             }
         }
         // TODO: Figure out a better way to do this so we're not wasting a
@@ -958,12 +962,12 @@ const APP: () = {
                 break;
             }
         }
-        // Turn off all relays if no keys are pressed
-        if !keydown {
-            let _ = relay1.set_high();
-            let _ = relay2.set_high();
-            let _ = relay3.set_high();
-        }
+        // Turn off all relays if no keys are pressed (TEMP DISABLED)
+        // if !keydown {
+        //     let _ = relay1.set_high();
+        //     let _ = relay2.set_high();
+        //     let _ = relay3.set_high();
+        // }
         // Do the buzzer thing:
         // if keydown {
         //     // rprintln!("Playing buzzer!");
