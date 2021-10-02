@@ -35,17 +35,24 @@ extern crate analog_multiplexer;
 extern crate panic_halt;
 
 // use core::sync;
+use core::cmp::min;
 use core::fmt::Write;
+use core::ops::Div;
+use core::str::from_utf8;
 use core::{borrow::BorrowMut, hint::spin_loop};
 
 // Generic embedded stuff
 extern crate nb;
+use heapless::String;
+// use alloc::string::ToString;
+use numtoa::NumToA;
 use cortex_m;
 // use cortex_m_rt::pre_init;
 // For putting the MCU in DFU mode
 use embedded_hal::digital::v2::{InputPin, OutputPin};
 use embedded_hal::spi::MODE_0;
 use rtic::app;
+use rtic::Monotonic;
 use rtic::cyccnt::U32Ext as _;
 use rtt_target::{rtt_init, UpChannel};
 use stm32f4xx_hal::adc::{config::AdcConfig, config::SampleTime, Adc};
@@ -89,7 +96,7 @@ mod multiplexers;
 
 // WS2812/smart-leds stuff
 use crate::ws2812::Ws2812;
-use smart_leds::{brightness, SmartLedsWrite, RGB8, colors};
+use smart_leds::{brightness, colors, SmartLedsWrite, RGB8};
 use ws2812_spi as ws2812;
 
 // max7219 stuff
@@ -97,7 +104,10 @@ use max7219::*;
 extern crate font8x8;
 
 // IR receiver stuff
-use infrared::{protocols::Nec, PeriodicReceiver};
+// use infrared::{protocol::Nec, PeriodicReceiver};
+use infrared::receiver::{Receiver, PinInput, Poll};
+use infrared::protocol::*;
+
 // use infrared::protocols::capture::Capture;
 // TODO: Switch the IR stuff to using interrupt-driven events if possible
 // TODO: Make it so that it supports all the supported infrared protocols (not just Nec)
@@ -112,7 +122,13 @@ use spi_memory::series25::Flash;
 const MEGABITS: u32 = 32; // Flash chip size in Mbit.
 const SIZE_IN_BYTES: u32 = (MEGABITS * 1024 * 1024) / 8; // Size of flash in bytes
 
+const DISPLAY_TICK_RATE: u32 = 84_000_000 / 1000; // How many times per second display.tick() will be called
+
 type UsbKeyClass = keyberon::Class<'static, UsbBusType, Leds>;
+
+const MV_DIVISOR: u16 = 4; // A cheap way to deal with voltage wobble/average things out
+                           // FYI: Setting the divisor to 4 should give us 80-100 "steps" of resolution per sensor
+const POWER_CHECK_INTERVAL: u32 = 84_000_000 / 2; // How often to check the state of external power (every 500ms)
 
 // This is a numpad with the Black Pill at the top so we'll use the built-in LED for Numlock:
 pub struct Leds {
@@ -139,6 +155,7 @@ const APP: () = {
         debug_ch4: UpChannel,
         debug_ch5: UpChannel,
         debug_ch6: UpChannel,
+        debug_ch7: UpChannel,
         usb_key_dev: aliases::UsbKeyDevice,
         usb_keyboard: UsbKeyClass,
         usb_mouse: aliases::UsbMouseDevice,
@@ -160,15 +177,22 @@ const APP: () = {
         // Keep track of the *initial* (resting) value of each sensor
         channel_states: [multiplexers::ChannelStates; config::KEYBOARD_NUM_MULTIPLEXERS + 1],
         debug_msg_counter: u16,
+        // debug_buf: [u8; 20], // Only used when converting numbers to strings
+        debug_buf: String<{ config::DISPLAY_BUFFER_LENGTH }>, // Only used when converting numbers to strings
         // ws: Ws2812<stm32f4xx_hal::timer::Timer<stm32f4xx_hal::stm32::TIM5>, PB5<Output<PushPull>>>,
         ws: aliases::SPIWS2812B,
+        ext_power: aliases::POWER,
         // flash: aliases::SPIFlash,
-        led_brightness_saved: u8, // So we can restore it when toggling
+        leds_max_brightness: u8, // Will be one of LEDS_MAX_BRIGHTNESS_POWERED or LEDS_MAX_BRIGHTNESS_UNPOWERED
+        leds_brightness_saved: u8, // So we can restore it when toggling
         led_data: [RGB8; config::LEDS_NUM_LEDS],
         led_state: u16,
-        display: display::Display<'static, { config::DISPLAY_BUFFER_LENGTH }>,
+        display: display::Display<{ config::DISPLAY_BUFFER_LENGTH }>,
+        display_brightness_saved: u8, // So we can restor it when toggling
+        display_message: display::Message<{ config::DISPLAY_BUFFER_LENGTH }>,
         rotary_clockwise: bool,
-        ir_recv: PeriodicReceiver<Nec, aliases::IRRecv>,
+        // ir_recv: PeriodicReceiver<Nec, aliases::IRPin>,
+        ir_recv: aliases::IrReceiver,
         // buzzer: pwm::PwmChannels<stm32::TIM1, C1>,
     }
 
@@ -180,22 +204,25 @@ const APP: () = {
         }
     }
 
-    #[init(schedule = [update_defaults, update_display])]
+    #[init(schedule = [power_check, update_defaults, update_display, tick_display])]
     // #[init]
     fn init(mut c: init::Context) -> init::LateResources {
         // Static stuff
         static mut EP_MEMORY: [u32; 1024] = [0; 1024];
         static mut USB_BUS: Option<UsbBusAllocator<UsbBusType>> = None;
+        // let debug_buf = [0u8; 20];
+        let debug_buf: String<{ config::DISPLAY_BUFFER_LENGTH }> = String::new();
         // Convert the various updates-per-second values to their cycles() equivalents
-        let defaults_refresh: u32 = 84_000_000 / config::KEYBOARD_UPDATE_DEFAULTS_RATE;
+        let recalibration_refresh: u32 = 84_000_000 * config::KEYBOARD_RECALIBRATION_RATE;
         let display_refresh: u32 = 84_000_000 / config::DISPLAY_REFRESH_INTERVAL;
 
         // TODO: Write a macro that loads these automatically
         let keyboard_config = config_structs::KeyboardConfig {
+            north_down: config::KEYBOARD_NORTH_DOWN,
             actuation_threshold: config::KEYBOARD_ACTUATION_THRESHOLD,
             release_threshold: config::KEYBOARD_RELEASE_THRESHOLD,
             ignore_below: config::KEYBOARD_IGNORE_BELOW,
-            update_defaults_rate: defaults_refresh,
+            recalibration_rate: recalibration_refresh,
             num_multiplexers: config::KEYBOARD_NUM_MULTIPLEXERS,
             max_channels: config::KEYBOARD_MAX_CHANNELS,
             usb_vid: config::KEYBOARD_USB_VID,
@@ -214,6 +241,8 @@ const APP: () = {
         };
         let leds_config = config_structs::LedsConfig {
             brightness: config::LEDS_BRIGHTNESS,
+            max_brightness_unpowered: config::LEDS_MAX_BRIGHTNESS_UNPOWERED,
+            max_brightness_powered: config::LEDS_MAX_BRIGHTNESS_POWERED,
             step: config::LEDS_STEP,
             num_leds: config::LEDS_NUM_LEDS,
             speed: config::LEDS_SPEED,
@@ -225,6 +254,7 @@ const APP: () = {
         let display_config = config_structs::DisplayConfig {
             num_matrices: config::DISPLAY_NUM_MATRICES,
             brightness: config::DISPLAY_BRIGHTNESS,
+            max_brightness: config::DISPLAY_MAX_BRIGHTNESS,
             buffer_length: config::DISPLAY_BUFFER_LENGTH,
             refresh_interval: display_refresh,
             vertical_flip: config::DISPLAY_VERTICAL_FLIP,
@@ -266,7 +296,7 @@ const APP: () = {
 
         // Schedule a task that occasionally checks if the default mV values need to be adjusted
         c.schedule
-            .update_defaults(c.start + config.keyboard.update_defaults_rate.cycles())
+            .update_defaults(c.start + config.keyboard.recalibration_rate.cycles())
             .unwrap();
 
         // Setup another timer for the RGB LEDs
@@ -274,12 +304,17 @@ const APP: () = {
         led_timer.listen(timer::Event::TimeOut);
         let led_state: u16 = 0;
 
-        // Setup another timer for the Display
+        // Setup two timers for the display:
+        // * One that shifts the message left according to the configured display_refresh
+        // * One that calls tick() every millisecond
         c.schedule
             .update_display(c.start + display_refresh.cycles())
             .unwrap();
         // let mut display_timer = timer::Timer::tim4(c.device.TIM4, display_refresh.hz(), clocks);
         // display_timer.listen(timer::Event::TimeOut);
+        c.schedule
+            .tick_display(c.start + DISPLAY_TICK_RATE.cycles())
+            .unwrap();
 
         // So we can use GPIOs...
         let gpioa = c.device.GPIOA.split();
@@ -292,6 +327,10 @@ const APP: () = {
 
         // Power detection input (if barrel jack is connected it will show as high)
         let ext_power = gpiob.pb10.into_pull_up_input();
+        // Setup a timer that checks the state of the external barrel jack
+        c.schedule
+            .power_check(c.start + POWER_CHECK_INTERVAL.cycles())
+            .unwrap();
 
         // Temporarily disabled relays while I figure out how to handle them better
         // // Relay pins
@@ -303,12 +342,19 @@ const APP: () = {
         // let _ = relay2.set_high();
         // let _ = relay3.set_high();
 
-
         // Infrared LED
         let ir_sensor_pin = gpiob.pb0.into_floating_input();
         // ir_sensor_pin.make_interrupt_source(&mut c.device.SYSCFG);
-        let ir_recv: PeriodicReceiver<Nec, aliases::IRRecv> =
-            PeriodicReceiver::new(ir_sensor_pin, config::IR_SAMPLERATE);
+        // let ir_recv: PeriodicReceiver<Nec, aliases::IRPin> =
+        //     PeriodicReceiver::new(ir_sensor_pin, config::IR_SAMPLERATE);
+        // let ir_recv = Receiver::new(config::IR_SAMPLERATE as usize, PinInput(ir_sensor_pin));
+        // let ir_recv = Receiver::builder()
+        //     .nec()
+        //     .polled()
+        //     .resolution(config::IR_SAMPLERATE as usize)
+        //     .pin(ir_sensor_pin)
+        //     .build();
+        let ir_recv = Receiver::with_pin(config::IR_SAMPLERATE as usize, ir_sensor_pin);
         // Setup a 20KHz timer for IR polling
         let mut ir_timer = timer::Timer::tim2(c.device.TIM2, config::IR_SAMPLERATE.hz(), clocks);
         ir_timer.listen(timer::Event::TimeOut);
@@ -377,7 +423,12 @@ const APP: () = {
         let max7219_display =
             MAX7219::from_pins(config::DISPLAY_NUM_MATRICES, data, cs, sck).unwrap();
         let mut display = display::Display::new(max7219_display, config::DISPLAY_NUM_MATRICES);
-        display.init();
+        // TODO: Make the default display message configurable via the Conf.toml (somehow)
+        let mut default_message = String::new();
+        // default_message.push_str("=) TYPE TYPE TYPE =) «» ");
+        default_message.push_str("Riskeyboard 70 «» ").unwrap();
+        let display_message = display::Message::new(String::new(), 1);
+        display.init(&default_message);
 
         // Setup WS2812B-B SPI output
         let mosi = gpiob
@@ -403,7 +454,9 @@ const APP: () = {
         //     clocks,
         // );
         let mut ws = Ws2812::new(spi);
-        let led_brightness_saved = config::LEDS_BRIGHTNESS;
+        let leds_brightness_saved = config::LEDS_BRIGHTNESS;
+        let mut leds_max_brightness = config::LEDS_MAX_BRIGHTNESS_UNPOWERED; // Start out with the low value
+        let display_brightness_saved = config::DISPLAY_BRIGHTNESS;
         // Make the LEDs off for startup
         let led_data = [RGB8::default(); config::LEDS_NUM_LEDS];
         // let led_data = [colors::WHITE; config::LEDS_NUM_LEDS]; // Make em all white by default
@@ -475,7 +528,7 @@ const APP: () = {
             .manufacturer("Riskable")
             .product("Riskeyboard 70")
             // Include a capabilities string (future stuff)
-            .serial_number(concat!(env!("CARGO_PKG_VERSION"), " 🖮v1.0:BEEF"))
+            .serial_number(concat!(env!("SERIALNOW"), " 🖮v1.0:BEEF"))
             .max_power(500) // Pull out as much as we can (for now)!
             .build();
 
@@ -512,7 +565,7 @@ const APP: () = {
                     4 => adc.convert(&analog_pins.4, sample_time),
                     _ => 0, // Riskeyboard 70 only has 5 multiplexers
                 };
-                let millivolts = adc.sample_to_millivolts(sample);
+                let millivolts = adc.sample_to_millivolts(sample).div(MV_DIVISOR);
                 match multi {
                     0 => ch_states0[chan as usize].update_default(millivolts),
                     1 => ch_states1[chan as usize].update_default(millivolts),
@@ -567,22 +620,32 @@ const APP: () = {
                     size: 512
                     name: "Other"
                 }
+                7: {
+                    size: 512
+                    name: "Display"
+                }
             }
         };
         let mut debug_ch0: UpChannel = rtt_channels.up.0;
-        let debug_ch1: UpChannel = rtt_channels.up.1;
-        let debug_ch2: UpChannel = rtt_channels.up.2;
-        let debug_ch3: UpChannel = rtt_channels.up.3;
-        let debug_ch4: UpChannel = rtt_channels.up.4;
-        let debug_ch5: UpChannel = rtt_channels.up.5;
-        let debug_ch6: UpChannel = rtt_channels.up.6;
+        let debug_ch1: UpChannel = rtt_channels.up.1; // General messages
+        let debug_ch2: UpChannel = rtt_channels.up.2; // AM0
+        let debug_ch3: UpChannel = rtt_channels.up.3; // AM1
+        let debug_ch4: UpChannel = rtt_channels.up.4; // AM2
+        let debug_ch5: UpChannel = rtt_channels.up.5; // AM3
+        let debug_ch6: UpChannel = rtt_channels.up.6; // AM4
+        let debug_ch7: UpChannel = rtt_channels.up.7; // Display-specific stuff
         let _ = writeln!(debug_ch0, "init()");
         // Check the state of the external power connector
         match ext_power.is_high() {
             Ok(result) => {
                 let _ = writeln!(debug_ch0, "External Barrel Jack Connected: {}", result);
+                leds_max_brightness = if result {
+                    config::LEDS_MAX_BRIGHTNESS_POWERED
+                } else {
+                    config::LEDS_MAX_BRIGHTNESS_UNPOWERED
+                }
             }
-        // NOTE: This only detects if a plug is inserted into the barrel jack; it doesn't detect if power is going into it.
+            // NOTE: This only detects if a plug is inserted into the barrel jack; it doesn't detect if power is going into it.
             _ => {
                 let _ = writeln!(debug_ch0, "Strange result from ext power check");
             }
@@ -599,6 +662,8 @@ const APP: () = {
             debug_ch4,
             debug_ch5,
             debug_ch6,
+            debug_ch7,
+            debug_buf,
             usb_key_dev,
             usb_keyboard,
             usb_mouse,
@@ -619,42 +684,167 @@ const APP: () = {
             debug_msg_counter,
             ws,
             // flash,
-            led_brightness_saved,
+            ext_power,
+            leds_max_brightness,
+            leds_brightness_saved,
             led_data,
             led_state,
             display,
+            display_brightness_saved,
+            display_message,
             rotary_clockwise,
             ir_recv,
             // buzzer,
         }
     }
 
+    // Checks the state of the power jack and updates leds_max_brightness accordingly
+    #[task(priority = 1, resources = [config, leds_max_brightness, ext_power, debug_ch6], schedule = [power_check])]
+    fn power_check(mut c: power_check::Context) {
+        let ext_power = c.resources.ext_power;
+        let mut _debug_ch6 = c.resources.debug_ch6;
+        let max_brightness_powered = c
+            .resources
+            .config
+            .lock(|conf| conf.leds.max_brightness_powered);
+        let max_brightness_unpowered = c
+            .resources
+            .config
+            .lock(|conf| conf.leds.max_brightness_unpowered);
+        // let powered = match ext_power.is_high() {
+        //     Ok(result) => result,
+        //     _ => false, // Something went wrong; which would be wacky
+        // };
+        let max_brightness = c.resources.leds_max_brightness.lock(|max_brightness| {
+            match ext_power.is_high() {
+                Ok(result) => {
+                    *max_brightness = if result {
+                        max_brightness_powered
+                    } else {
+                        max_brightness_unpowered
+                    };
+                    // _debug_ch6.lock(|debug_ch6| {
+                    //     let _ = writeln!(
+                    //         debug_ch6,
+                    //         "External Barrel Jack Connected: {}, leds_max_brightness: {}",
+                    //         result, max_brightness
+                    //     );
+                    // });
+                    *max_brightness
+                }
+                Err(_) => todo!(),
+            }
+        });
+        // Make sure the active brightness reflects the current power situation (in case the user unplugged power)
+        let _brightness = c.resources.config.lock(|conf| {
+            conf.leds.brightness = min(max_brightness, conf.leds.brightness);
+            conf.leds.brightness
+        });
+        // _debug_ch6.lock(|debug_ch6| {
+        //     let _ = writeln!(
+        //         debug_ch6,
+        //         "leds_brightness: {}",
+        //         _brightness
+        //     );
+        // });
+        c.schedule
+            .power_check(c.scheduled + POWER_CHECK_INTERVAL.cycles())
+            .unwrap();
+    }
+
     // For now, just scrolls whatever is in the buffer to the left and pushes it to the display
     // every time it runs
     // #[task(binds = TIM4, priority = 1, resources = [display, display_timer, debug_ch6])]
-    #[task(priority = 1, resources = [config, display, debug_ch6], schedule = [update_display])]
+    #[task(priority = 1, resources = [config, display, display_message, debug_ch6], schedule = [update_display])]
     fn update_display(mut c: update_display::Context) {
         let display_refresh = c
             .resources
             .config
             .lock(|conf| conf.display.refresh_interval);
+        let disp_message = c.resources.display_message.lock(|mess| {
+            let message = mess.clone();
+            // Clear out the display_message so we know it's been taken care of:
+            mess.text.clear();
+            message
+         });
+        // c.resources.debug_ch6.lock(|_debug_ch6| {
+        //     let _ = writeln!(
+        //         _debug_ch6,
+        //         "display_text: {:?} (display_time: {:?})",
+        //         disp_message.text, disp_message.time
+        //     );
+        // });
         c.resources.display.lock(|disp| {
+            if disp_message.text.len() > 0 { // Copy it to a new display::Message
+                let mut string: String<{ config::DISPLAY_BUFFER_LENGTH }> = String::new();
+                let _ = string.push_str(&disp_message.text.clone());
+                let message = display::Message::new(string, disp_message.time);
+                disp.messages.push(message).unwrap();
+            }
             disp.shift_left();
             disp.sync();
+            // disp.tick();
         });
+        // Clear out the display_message so we know it's been taken care of:
+        // c.resources.display_message.lock(|mess| mess.text.clear());
         c.schedule
             .update_display(c.scheduled + display_refresh.cycles())
             .unwrap();
     }
 
+    // Calls display.tick() so messages get rotated in and out properly
+    #[task(priority = 1, resources = [config, display, debug_ch7], schedule = [tick_display])]
+    fn tick_display(mut c: tick_display::Context) {
+        let _debug_ch7 = c.resources.debug_ch7;
+        c.resources.display.lock(|disp| {
+            // let _ = writeln!(
+            //     _debug_ch7,
+            //     "display messages: {:?}",
+            //     disp.messages
+            // );
+            match disp.tick() {
+                Ok(_) => {
+                    // let _ = writeln!(
+                    //     _debug_ch7,
+                    //     "display messages: {:?}",
+                    //     disp.messages
+                    // );
+                },
+                Err(_) => {
+                    let _ = writeln!(
+                        _debug_ch7,
+                        "error writing: {:?}",
+                        disp.messages
+                    );
+                },
+            }
+        });
+        // c.resources.display.lock(|disp| {
+        //     disp.tick();
+        // });
+        c.schedule
+            .tick_display(c.scheduled + DISPLAY_TICK_RATE.cycles())
+            .unwrap();
+    }
+
     // Extra high priority on this one since it is *very* sensitive to timing
-    #[task(binds = TIM2, priority = 5, resources = [ir_button, ir_timer, ir_recv, debug_ch6])]
+    #[task(binds = TIM2, priority = 5, resources = [ir_button, ir_timer, ir_recv, display_message, debug_buf, debug_ch6])]
     fn do_ir(c: do_ir::Context) {
         c.resources.ir_timer.clear_interrupt(timer::Event::TimeOut);
+        // let mut buf = [0u8; 20];
         let ir_recv = c.resources.ir_recv;
         let _debug_ch6 = c.resources.debug_ch6;
+        // let debug_buf = c.resources.debug_buf;
+        // let now: = Monotonic::now();
+        // let now = c.start;
+        // let dt = now
+        //     .checked_duration_since(&last_event)
+        //     .and_then(|v| Microseconds::<u32>::try_from(v).ok())
+        //     .map(|ms| ms.0 as usize)
+        //     .unwrap_or_default();
         if let Ok(Some(cmd)) = ir_recv.poll() {
-            use infrared::remotecontrol::RemoteControl;
+            use infrared::remotecontrol::RemoteControlModel;
+            // use infrared::remotecontrol::RemoteControl;
             // let _ = writeln!(
             //     _debug_ch6,
             //     "IR: {:?} (ir_button: {:?})",
@@ -662,11 +852,37 @@ const APP: () = {
             // );
             if !cmd.repeat {
                 // Only do this once
-                if let Some(button) = ir_remote::IRRemote::decode(cmd) {
+                if let Some(button) = ir_remote::IRRemote::decode(&cmd) {
                     let index = ir_remote::IRRemote::index(button) as u8;
-                    // let _ = writeln!(_debug_ch6, "{:?} (index: {})", button, index);ccccc
+                    let _ = writeln!(_debug_ch6, "{:?} (index: {})", button, index);
+                    // let mut _cmd: &[u8; 1] = &[cmd.cmd];
+                    let (code, _) = ir_remote::IRRemote::BUTTONS[index as usize];
+                    let mut string: String<{ config::DISPLAY_BUFFER_LENGTH }> = String::new();
+                    let mut buf = [0u8; 20];
+                    // let _cmd = ir_remote::IRRemote::to_string(code);
+                    // let _cmd = code.numtoa_str(10, &mut NUM_BUFFER);
+                    let _ = string.push_str(code.numtoa_str(10, &mut buf));
+                    // let s_slice: &str = &string;
+                    // let s_slice: &str = debug_buf.as_str();
+                    // let _cmd = code.numtoa_str(10, debug_buf);
+                    // let _cmd = core::str::from_utf8(&[cmd.cmd]).unwrap();
+                    // let _cmd: &[u8; 1] = &[_cmd as u8];
+                    // let _cmd = core::str::from_utf8(&[code as u8]).unwrap();
+                    // let _cmd = cmd.cmd.to_string();
+                    // *c.resources.display_message = display::Message::new("It works    ", 5000);
+                    // *c.resources.display_message = display::Message::new(string, 3000);
                     *c.resources.ir_button = index; // This is how tick() can know what was pressed
                 }
+                // TODO: Make this preserve the default message and restore it after a time
+                // c.resources.display.lock(|disp| {
+                //     // Display the IR code
+                //     disp.write_str(c.resources.ir_button);
+                // });
+                // c.resources.display.write_str(core::str::from_utf8(&[8]).unwrap());
+                // c.resources.display.write_str("Well this part works   ");
+                // c.resources
+                //     .display
+                //     .write_str(core::str::from_utf8(&[*c.resources.ir_button]).unwrap());
             }
         }
     }
@@ -731,6 +947,7 @@ const APP: () = {
         let ws = c.resources.ws;
         let led_data = c.resources.led_data;
         let led_state = c.resources.led_state;
+        // TODO: Make the effect configurable
         // Do the rainbow run thing (for now)
         for i in 0..config::LEDS_NUM_LEDS {
             led_data[i] = wheel(
@@ -770,44 +987,73 @@ const APP: () = {
     //     send_report(c.resources.layout.keycodes(), &mut c.resources.usb_class);
     // }
 
-    // Changes the default mV values on all channels if there's big a significant change
+    // Changes the default mV values on all channels if there's a significant change
     #[task(priority = 1, resources = [config, channel_states, debug_ch0], schedule = [update_defaults])]
     fn update_defaults(mut c: update_defaults::Context) {
         let mut ch_states = c.resources.channel_states;
-        let defaults_refresh = c
+        let recalibration_refresh = c
             .resources
             .config
-            .lock(|conf| conf.keyboard.update_defaults_rate);
+            .lock(|conf| conf.keyboard.recalibration_rate);
         // c.resources.debug_ch0.lock(|ch| {
         //     let _ = writeln!(ch, "update_defaults()");
         // });
+        // First check if the user removed the top plate by checking if *all* the states changed by a large amount at once
+        let mut total_difference: u32 = 0;
         for chan in 0..16 {
             for multi in 0..config::KEYBOARD_NUM_MULTIPLEXERS {
-                let ch_state = ch_states.lock(|ch_s| ch_s[multi][chan]);
                 // We need to skip the encoder since it uses the default value in a different way
                 if multi == config::ENCODER_MUX {
                     if chan == config::ENCODER_CHANNEL1 || chan == config::ENCODER_CHANNEL2 {
                         break;
                     }
                 }
+                let ch_state = ch_states.lock(|ch_s| ch_s[multi][chan]);
                 // Check if the overall voltage changed and adjust default if necessary
                 if !ch_state.pressed {
-                    if ch_state.value > ch_state.default {
-                        let difference = ch_state.value - ch_state.default;
-                        if difference > config::KEYBOARD_RELEASE_THRESHOLD {
-                            c.resources.debug_ch0.lock(|ch| {
-                                let _ = writeln!(
-                                    ch,
-                                    "New default value for mux:{:?} chan:{:?} ({:?})",
-                                    multi, chan, ch_state.value
-                                );
-                            });
-                            ch_states.lock(|states| {
-                                states[multi].update_default_by_index(chan, ch_state.value)
-                            });
-                        }
+                    let difference = if ch_state.value < ch_state.default {
+                        ch_state.default - ch_state.value // North side down switches result in a mV drop
                     } else {
-                        let difference = ch_state.default - ch_state.value;
+                        ch_state.value - ch_state.default // South side down switches result in a mV increase
+                    };
+                    total_difference = total_difference + difference as u32;
+                }
+            }
+        }
+        let max_allowed_difference = config::KEYBOARD_NUM_MULTIPLEXERS * 16 * 5;
+        c.resources.debug_ch0.lock(|ch| {
+            // let _ = writeln!(ch, "Total mV difference:{:?}", total_difference);
+            if total_difference > max_allowed_difference as u32 {
+                let _ = writeln!(
+                    ch,
+                    "USER REMOVED TOP PLATE (total diff: {}). Skipping recalibration...",
+                    total_difference
+                );
+            }
+        });
+        if total_difference < max_allowed_difference as u32 {
+            // c.resources.debug_ch0.lock(|ch| {
+            //     let _ = writeln!(ch, "Checking mV differences...");
+            // });
+            // Now handle updating the defaults
+            for chan in 0..16 {
+                for multi in 0..config::KEYBOARD_NUM_MULTIPLEXERS {
+                    // We need to skip the encoder since it uses the default value in a different way
+                    if multi == config::ENCODER_MUX {
+                        if chan == config::ENCODER_CHANNEL1 || chan == config::ENCODER_CHANNEL2 {
+                            break;
+                        }
+                    }
+                    let ch_state = ch_states.lock(|ch_s| ch_s[multi][chan]);
+                    // Check if the overall voltage changed and adjust default if necessary
+                    if !ch_state.pressed {
+                        // NOTE: For recalibration we don't care about north/south so much as we just want to get a baseline value
+                        let difference = if ch_state.value < ch_state.default {
+                            ch_state.default - ch_state.value // North side down switches result in a mV drop
+                        } else {
+                            ch_state.value - ch_state.default // South side down switches result in a mV increase
+                        };
+                        // This uses the KEYBOARD_RELEASE_THRESHOLD because it should be a convenient, reasonably low value:
                         if difference > config::KEYBOARD_RELEASE_THRESHOLD {
                             c.resources.debug_ch0.lock(|ch| {
                                 let _ = writeln!(
@@ -825,13 +1071,14 @@ const APP: () = {
             }
         }
         c.schedule
-            .update_defaults(c.scheduled + defaults_refresh.cycles())
+            .update_defaults(c.scheduled + recalibration_refresh.cycles())
             .unwrap();
     }
 
     #[task(binds = TIM3, priority = 2, resources = [
         config, debug_msg_counter, usb_keyboard, usb_mouse, layout, multiplexer,
-        led_brightness_saved, rotary_clockwise, ir_button, display,
+        leds_max_brightness, leds_brightness_saved, display_brightness_saved,
+        rotary_clockwise, ir_button, display,
         // relay1, relay2, relay3,
         debug_ch0, debug_ch1, debug_ch2, debug_ch3, debug_ch4, debug_ch5,
         timer, adc, analog_pins, channel_states])]
@@ -858,9 +1105,14 @@ const APP: () = {
         let ch_states = c.resources.channel_states;
         let debug_msg_counter = c.resources.debug_msg_counter;
         let rotary_clockwise = c.resources.rotary_clockwise;
-        let brightness_saved = c.resources.led_brightness_saved;
+        let leds_brightness_saved = c.resources.leds_brightness_saved;
+        let leds_max_brightness = c.resources.leds_max_brightness;
+        let display_brightness_saved = c.resources.display_brightness_saved;
         let mut ir_button = c.resources.ir_button;
-        let display = c.resources.display;
+        let mut display = c.resources.display;
+        // let display = c.resources.display.lock(|disp| {
+        //     disp
+        // });
         // let relay1 = c.resources.relay1;
         // let relay2 = c.resources.relay2;
         // let relay3 = c.resources.relay3;
@@ -889,12 +1141,12 @@ const APP: () = {
                     4 => adc.convert(&analog_pins.4, sample_time),
                     _ => 0, // Riskeyboard 70 only has 5 multiplexers
                 };
-                let millivolts = adc.sample_to_millivolts(sample);
+                let millivolts = adc.sample_to_millivolts(sample).div(MV_DIVISOR);
                 // Record the channel's previous state so we can tell if it's state changed (for relays)
                 let prev_ch_state = ch_states[multi][chan as usize].pressed;
                 // Now record the state of each channel:
                 ch_states[multi][chan as usize].record_value(millivolts);
-                let _ = check_channel(
+                let _ = multiplexers::check_channel(
                     multi as usize,
                     chan as usize,
                     millivolts,
@@ -1011,26 +1263,100 @@ const APP: () = {
                     let _ = writeln!(debug_ch0, "CustomEvent Press: {:?}", event);
                     match event {
                         layers::CustomActions::LEDUp => {
-                            conf.leds.brightness =
-                                conf.leds.brightness.saturating_add(config::LEDS_STEP);
-                            display.set_brightness(conf.leds.brightness);
-                            let _ = writeln!(debug_ch0, "Brightness: {}", conf.leds.brightness);
+                            conf.leds.brightness = min(
+                                conf.leds.brightness.saturating_add(config::LEDS_STEP),
+                                *leds_max_brightness,
+                            );
+                            let _ = writeln!(debug_ch0, "LED Brightness: {}", conf.leds.brightness);
                         }
                         layers::CustomActions::LEDDown => {
                             conf.leds.brightness =
                                 conf.leds.brightness.saturating_sub(config::LEDS_STEP);
-                            display.set_brightness(conf.leds.brightness);
-                            let _ = writeln!(debug_ch0, "Brightness: {}", conf.leds.brightness);
+                            let _ = writeln!(debug_ch0, "LED Brightness: {}", conf.leds.brightness);
                         }
                         layers::CustomActions::LEDToggle => {
                             if conf.leds.brightness > 0 {
-                                *brightness_saved = conf.leds.brightness;
+                                *leds_brightness_saved = conf.leds.brightness;
                                 conf.leds.brightness = 0;
                             } else {
-                                conf.leds.brightness = *brightness_saved;
+                                conf.leds.brightness = *leds_brightness_saved;
                             }
-                            display.set_brightness(conf.leds.brightness);
-                            let _ = writeln!(debug_ch0, "LED Toggle: {}", conf.leds.brightness);
+                            let _ = writeln!(
+                                debug_ch0,
+                                "LED Toggle: LED brightness {}",
+                                conf.leds.brightness
+                            );
+                        }
+                        layers::CustomActions::DisplayUp => {
+                            conf.display.brightness =
+                                conf.display.brightness.saturating_add(config::LEDS_STEP);
+                            // c.resources.display.lock(|disp| {
+                            //     disp.set_brightness(conf.display.brightness);
+                            // });
+                            // display.lock(|disp| disp.set_brightness(conf.display.brightness));
+                            display.set_brightness(conf.display.brightness);
+                            let _ = writeln!(
+                                debug_ch0,
+                                "Display Brightness: {}",
+                                conf.display.brightness
+                            );
+                        }
+                        layers::CustomActions::DisplayDown => {
+                            conf.display.brightness =
+                                conf.display.brightness.saturating_sub(config::LEDS_STEP);
+                            // c.resources.display.lock(|disp| {
+                            //     disp.set_brightness(conf.display.brightness);
+                            // });
+                            // display.set_brightness(conf.display.brightness);
+                            // display.lock(|disp| disp.set_brightness(conf.display.brightness));
+                            display.set_brightness(conf.display.brightness);
+                            let _ = writeln!(
+                                debug_ch0,
+                                "Display Brightness: {}",
+                                conf.display.brightness
+                            );
+                        }
+                        layers::CustomActions::DisplayToggle => {
+                            if conf.display.brightness > 0 {
+                                *display_brightness_saved = conf.display.brightness;
+                                conf.display.brightness = 0;
+                            } else {
+                                conf.display.brightness = *display_brightness_saved;
+                            }
+                            // c.resources.display.lock(|disp| {
+                            //     disp.set_brightness(conf.display.brightness);
+                            // });
+                            display.set_brightness(conf.display.brightness);
+                            // display.lock(|disp| disp.set_brightness(conf.display.brightness));
+                            let _ = writeln!(
+                                debug_ch0,
+                                "Lighting Toggle: Display Brightness: {}",
+                                conf.display.brightness
+                            );
+                        }
+                        layers::CustomActions::LightingToggle => {
+                            if conf.leds.brightness > 0 {
+                                *leds_brightness_saved = conf.leds.brightness;
+                                conf.leds.brightness = 0;
+                            } else {
+                                conf.leds.brightness = *leds_brightness_saved;
+                            }
+                            if conf.display.brightness > 0 {
+                                *display_brightness_saved = conf.display.brightness;
+                                conf.display.brightness = 0;
+                            } else {
+                                conf.display.brightness = *display_brightness_saved;
+                            }
+                            // c.resources.display.lock(|disp| {
+                            //     disp.set_brightness(conf.display.brightness);
+                            // });
+                            display.set_brightness(conf.display.brightness);
+                            // display.lock(|disp| disp.set_brightness(conf.display.brightness));
+                            let _ = writeln!(
+                                debug_ch0,
+                                "Lighting Toggle: LED brightness {}, Display Brightness: {}",
+                                conf.leds.brightness, conf.display.brightness
+                            );
                         }
                         layers::CustomActions::Mouse1 => {
                             mouse_report.buttons = 1 << 0;
@@ -1116,375 +1442,6 @@ const APP: () = {
         // fn TIM1();
     }
 };
-
-///! Updates the status of all the Keyberon stuff in *layout* and returns true if a NEW keypress or rotary encoder movement was detected
-fn check_channel(
-    multilpexer: usize,
-    chan: usize,
-    millivolts: u16,
-    ch_states: &mut [multiplexers::ChannelStates],
-    layout: &mut Layout<layers::CustomActions>,
-    rotary_clockwise: &mut bool,
-    actuation_threshold: u16,
-    encoder_press_threshold: u16,
-    release_threshold: u16,
-    _debug_ch0: &mut UpChannel,
-) -> bool {
-    let ch_state = ch_states[multilpexer][chan];
-    if ch_state.value > config::KEYBOARD_IGNORE_BELOW {
-        // Normal keys only go down in volts when pressed (north side down)
-        let voltage_difference = if millivolts < ch_state.default {
-            ch_state.default - millivolts
-        } else {
-            0 // TODO: Figure out if we want to support south side down too (it's not as sensitive)
-        };
-        // let _ = writeln!(_debug_ch0, "voltage_difference: {:?}", voltage_difference);
-        // Handle the rotary encoders since they're special
-        /* NOTE: Here's how the rotary encoder logic works:
-            * ENCODER1's action in Layers is used for clockwise movements (so we can use Keyberon's event system)
-            * ENCODER2's action in Layers is used for counter-clockwise movements
-            * The unused sensor after ENCODER2 is used for ENCODER_PRESS (RotaryPress) which presently isn't used
-
-            Change direction (enc1 and enc2 rising):
-                false false -> true true
-                true true -> false false
-                false true -> true false
-                true false -> false true
-
-            Always CW:
-                false false -> true false
-                true false -> true true
-                true true -> false true
-                false true -> false false
-
-            Always CCW:
-                false false -> false true
-                false true -> true true
-                true true -> true false
-                true false -> false false
-        */
-        if multilpexer == config::ENCODER_MUX {
-            if chan == config::ENCODER_CHANNEL2 {
-                let cw_event_chan = config::ENCODER_CHANNEL1 as u8;
-                let ccw_event_chan = config::ENCODER_CHANNEL2 as u8;
-                let encoder_press_chan = config::ENCODER_PRESS_CHANNEL as u8;
-                // The rotary encoder values could go up or down depending on which side
-                // of the magnets are over the sensors
-                let encoder2_voltage_difference = if millivolts < ch_state.default {
-                    ch_state.default - millivolts
-                } else {
-                    millivolts - ch_state.default
-                };
-                let enc1 = ch_states[multilpexer][cw_event_chan as usize];
-                let enc2 = ch_states[multilpexer][ccw_event_chan as usize];
-                let enc1_rising = if enc1.value > enc1.default {
-                    true
-                } else {
-                    false
-                };
-                let enc2_rising = if enc2.value > enc2.default {
-                    true
-                } else {
-                    false
-                };
-                // Get encoder1's voltage difference too so we can detect a press event properly
-                let encoder1_voltage_difference = if enc1.value < enc1.default {
-                    enc1.default - enc1.value
-                } else {
-                    enc1.value - enc1.default
-                };
-                // let _ = writeln!(_debug_ch0, "enc1_mv: {:?} enc2_mv: {:?}", enc1.value, enc2.value);
-                // let _ = writeln!(_debug_ch0, "enc1.low: {:?} enc2.low: {:?}", enc1.low, enc2.low);
-                // Encoder Press() events are disabled for now because it's probably impossible to detect reliably
-                // with the current PCB design.
-                // // Encoder Press() needs to be handled before all other encoder stuff
-                // let combined_encoder_voltage_difference =
-                //     encoder1_voltage_difference + encoder2_voltage_difference;
-                // if combined_encoder_voltage_difference > encoder_press_threshold {
-                //     if enc1.pressed {
-                //         ch_states[multilpexer][cw_event_chan as usize].release();
-                //         ch_states[multilpexer][cw_event_chan as usize].default = enc1.value;
-                //         let _ =
-                //             layout.event(Event::Release(multilpexer as u8, cw_event_chan as u8));
-                //     }
-                //     if enc2.pressed {
-                //         ch_states[multilpexer][ccw_event_chan as usize].release();
-                //         ch_states[multilpexer][ccw_event_chan as usize].default = enc2.value;
-                //         let _ =
-                //             layout.event(Event::Release(multilpexer as u8, ccw_event_chan as u8));
-                //     }
-                //     if ch_states[multilpexer][encoder_press_chan as usize].pressed {
-                //         return true; // It's still pressed
-                //     } else {
-                //         let _ = writeln!(
-                //             _debug_ch0,
-                //             "encoder press 1: {} 2: {}",
-                //             encoder1_voltage_difference, encoder2_voltage_difference
-                //         );
-                //         ch_states[multilpexer][encoder_press_chan as usize].press();
-                //         let _ =
-                //             layout.event(Event::Press(multilpexer as u8, encoder_press_chan as u8));
-                //         // Update the defaults so we get correct comparisons after
-                //         // ch_states[multilpexer]
-                //         //     .update_default_by_index(cw_event_chan as usize, enc1.value);
-                //         // ch_states[multilpexer]
-                //         //     .update_default_by_index(ccw_event_chan as usize, enc2.value);
-                //         return true;
-                //     }
-                // } else if ch_states[multilpexer][encoder_press_chan as usize].pressed {
-                //     let _ = writeln!(
-                //         _debug_ch0,
-                //         "encoder release 1: {} 1def: {} 2: {} 2def: {}",
-                //         enc1.value, enc1.default, enc2.value, enc2.default
-                //     );
-                //     ch_states[multilpexer][encoder_press_chan as usize].release();
-                //     let _ =
-                //         layout.event(Event::Release(multilpexer as u8, encoder_press_chan as u8));
-                //     // Update the defaults so we get correct comparisons after
-                //     ch_states[multilpexer]
-                //         .update_default_by_index(cw_event_chan as usize, enc1.value);
-                //     ch_states[multilpexer]
-                //         .update_default_by_index(ccw_event_chan as usize, enc2.value);
-                //     return false;
-                // }
-                if encoder1_voltage_difference > config::ENCODER_RESOLUTION
-                    || encoder2_voltage_difference > config::ENCODER_RESOLUTION
-                {
-                    // let _ = writeln!(_debug_ch0, "encoder_voltage_difference: {:?}", encoder_voltage_difference);
-                    // let _ = writeln!(_debug_ch0, "enc1_mv: {:?} enc2_mv: {:?}", enc1.value, enc2.value);
-                    // let _ = writeln!(_debug_ch0, "enc1_default: {:?} enc2_default: {:?}", enc1.default, enc2.default);
-                    // let _ = writeln!(_debug_ch0, "enc1_rising: {:?} enc2_rising: {:?}", enc1_rising, enc2_rising);
-                    if enc1_rising && enc2_rising {
-                        // true true
-                        if enc1.rising && !enc2.rising {
-                            // Previous true false means clockwise
-                            *rotary_clockwise = true;
-                            ch_states[multilpexer][cw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                        } else if !enc1.rising && enc2.rising {
-                            // Previous false true means counterclockwise
-                            *rotary_clockwise = false;
-                            ch_states[multilpexer][ccw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                        } else if !enc1.rising && !enc2.rising {
-                            // Change of direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            } else {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            }
-                        } else if enc1.rising && enc2.rising {
-                            // Continue our present direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            } else {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            }
-                        }
-                    } else if !enc1_rising && !enc2_rising {
-                        // false false
-                        if !enc1.rising && enc2.rising {
-                            // Previous false true means clockwise
-                            *rotary_clockwise = true;
-                            ch_states[multilpexer][cw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                        } else if enc1.rising && !enc2.rising {
-                            // Previous true false means counterclockwise
-                            *rotary_clockwise = false;
-                            ch_states[multilpexer][ccw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                        } else if enc1.rising && enc2.rising {
-                            // Change of direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            } else {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            }
-                        } else if !enc1.rising && !enc2.rising {
-                            // Continue our present direction
-                            if *rotary_clockwise {
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            } else {
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            }
-                        }
-                    } else if !enc1_rising && enc2_rising {
-                        // false true
-                        if enc1.rising && enc2.rising {
-                            // Previous true true means clockwise
-                            *rotary_clockwise = true;
-                            ch_states[multilpexer][cw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                        } else if !enc1.rising && !enc2.rising {
-                            // Previous false false means counterclockwise
-                            *rotary_clockwise = false;
-                            ch_states[multilpexer][ccw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                        } else if enc1.rising && !enc2.rising {
-                            // Change of direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            } else {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            }
-                        } else if !enc1.rising && enc2.rising {
-                            // Continue our present direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            } else {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            }
-                        }
-                    } else if enc1_rising && !enc2_rising {
-                        // true false
-                        if !enc1.rising && !enc2.rising {
-                            // Previous false false means clockwise
-                            *rotary_clockwise = true;
-                            ch_states[multilpexer][cw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                        } else if enc1.rising && enc2.rising {
-                            // Previous true true means counterclockwise
-                            *rotary_clockwise = false;
-                            ch_states[multilpexer][ccw_event_chan as usize].press();
-                            let _ = layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                        } else if !enc1.rising && enc2.rising {
-                            // Change of direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            } else {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            }
-                        } else if enc1.rising && !enc2.rising {
-                            // Continue our present direction
-                            if *rotary_clockwise {
-                                *rotary_clockwise = true;
-                                ch_states[multilpexer][cw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, cw_event_chan));
-                            } else {
-                                *rotary_clockwise = false;
-                                ch_states[multilpexer][ccw_event_chan as usize].press();
-                                let _ =
-                                    layout.event(Event::Press(multilpexer as u8, ccw_event_chan));
-                            }
-                        }
-                    }
-                    // Reset to current value
-                    ch_states[multilpexer]
-                        .update_default_by_index(cw_event_chan as usize, enc1.value);
-                    ch_states[multilpexer]
-                        .update_default_by_index(ccw_event_chan as usize, enc2.value);
-                    ch_states[multilpexer]
-                        .update_rising_by_index(cw_event_chan as usize, enc1_rising);
-                    ch_states[multilpexer]
-                        .update_rising_by_index(ccw_event_chan as usize, enc2_rising);
-                    return true;
-                } else {
-                    // Reset pressed state immediately ("pressed" doesn't make sense for rotational movements)
-                    if enc1.pressed {
-                        ch_states[multilpexer][cw_event_chan as usize].release();
-                        ch_states[multilpexer][cw_event_chan as usize].default = enc1.value;
-                        let _ =
-                            layout.event(Event::Release(multilpexer as u8, cw_event_chan as u8));
-                    }
-                    if enc2.pressed {
-                        ch_states[multilpexer][ccw_event_chan as usize].release();
-                        ch_states[multilpexer][ccw_event_chan as usize].default = enc2.value;
-                        let _ =
-                            layout.event(Event::Release(multilpexer as u8, ccw_event_chan as u8));
-                    }
-                    if ch_states[multilpexer][encoder_press_chan as usize].pressed {
-                        let _ = writeln!(_debug_ch0, "encoder release");
-                        ch_states[multilpexer][encoder_press_chan as usize].release();
-                        let _ = layout
-                            .event(Event::Release(multilpexer as u8, encoder_press_chan as u8));
-                    }
-                    return false;
-                }
-            }
-        }
-        // Handle normal keypresses
-        if voltage_difference > actuation_threshold {
-            if !ch_state.pressed {
-                // let _ = writeln!(_debug_ch0,
-                //     "Triggering Press event for ADC pin: PA{}, channel {} ({})",
-                //     multilpexer,
-                //     chan,
-                //     voltage_difference);
-                // Encoder press doesn't work very reliably (needs work--probably a change to the PCB):
-                if multilpexer == config::ENCODER_MUX {
-                    if chan != config::ENCODER_CHANNEL1 && chan != config::ENCODER_CHANNEL2 {
-                        ch_states[multilpexer].press(chan);
-                        let _ = layout.event(Event::Press(multilpexer as u8, chan as u8));
-                    }
-                } else {
-                    ch_states[multilpexer].press(chan);
-                    let _ = layout.event(Event::Press(multilpexer as u8, chan as u8));
-                }
-                return true;
-            }
-        } else if voltage_difference < release_threshold {
-            if ch_state.pressed {
-                // let _ = writeln!(_debug_ch0,
-                //     "Triggering Release event for ADC pin: PA{}, channel {} ({})",
-                //     multilpexer,
-                //     chan,
-                //     voltage_difference);
-                if multilpexer == config::ENCODER_MUX {
-                    if chan != config::ENCODER_CHANNEL1 && chan != config::ENCODER_CHANNEL2 {
-                        ch_states[multilpexer].release(chan);
-                        let _ = layout.event(Event::Release(multilpexer as u8, chan as u8));
-                    }
-                } else {
-                    ch_states[multilpexer].release(chan);
-                    let _ = layout.event(Event::Release(multilpexer as u8, chan as u8));
-                }
-                return false;
-            }
-        }
-    }
-    false
-}
 
 fn send_keyboard_report(
     iter: impl Iterator<Item = KeyCode>,

@@ -1,10 +1,9 @@
+use num_format::{Buffer, CustomFormat};
 /// Configuration structs; separate from config.rs so we can use them in build.rs without having to duplicate them
-
 // use core::fmt::Write;
 // use heapless::String;
 // use heapless::consts::U32;
-use serde::{Serialize, Deserialize};
-use num_format::{Buffer, CustomFormat};
+use serde::{Deserialize, Serialize};
 // use core::fmt::Display;
 
 // This lets us generate a userconfig.rs from inside build.rs that gets include!(concat!()) inside config.rs:
@@ -78,41 +77,39 @@ macro_rules! add_const_gen {
 }
 
 struct IsInt<'__, T>(&'__ T);
-impl<Int : ::num_format::ToFormattedStr> IsInt<'_, Int> {
-    fn pretty_display (self: Self)
-      -> impl 'static + ::core::fmt::Display
-    {
-        let ref rust_format =
-            CustomFormat::builder()
-                .separator("_")
-                .build()
-                .unwrap()
-        ;
+impl<T: ::num_format::ToFormattedStr> IsInt<'_, T> {
+    fn pretty_display(self: Self) -> impl 'static + ::core::fmt::Display {
+        let ref rust_format = CustomFormat::builder().separator("_").build().unwrap();
         let mut buf = Buffer::default();
         buf.write_formatted(self.0, rust_format);
         buf
     }
 }
 
+// impl<T: ::num_format::ToFormattedStr> bool {
+//     fn pretty_display(self: Self) -> impl 'static + ::core::fmt::Display {
+//         let ref rust_format = CustomFormat::builder().separator("_").build().unwrap();
+//         let mut buf = Buffer::default();
+//         buf.write_formatted(self.0, rust_format);
+//         buf
+//     }
+// }
+
 trait Fallback<'__, T> {
-    fn pretty_display (self: Self)
-      -> &'__ T
-    ;
+    fn pretty_display(self: Self) -> &'__ T;
 }
-impl<'lt, T : ::core::fmt::Display> Fallback<'lt, T>
-    for IsInt<'lt, T>
-{
-    fn pretty_display (self: Self)
-      -> &'lt T
-    {
+impl<'lt, T: ::core::fmt::Display> Fallback<'lt, T> for IsInt<'lt, T> {
+    fn pretty_display(self: Self) -> &'lt T {
         self.0
     }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to keys, sensors, and the rotary encoder
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyboardConfig {
+    /// Millivolts difference where we consider it a Press()
+    pub north_down: u8,
     /// Millivolts difference where we consider it a Press()
     pub actuation_threshold: u16,
     /// Millivolts above the actuation threshold where we consider it a Release() (prevents bouncing)
@@ -120,7 +117,7 @@ pub struct KeyboardConfig {
     /// Millivolt values below this value will be ignored (so we can skip mux pins connected to ground)
     pub ignore_below: u16,
     /// How often to check to see if the default mV values need to be adjusted (cycles)
-    pub update_defaults_rate: u32,
+    pub recalibration_rate: u32,
     /// Total number of multiplexers on this keyboard
     pub num_multiplexers: usize,
     /// Maximum number of channels per multiplexer or buttons per IR remote (use whatever is greater)
@@ -132,7 +129,7 @@ pub struct KeyboardConfig {
 }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to mouse emulation
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MouseConfig {
@@ -141,7 +138,7 @@ pub struct MouseConfig {
 }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to a rotary encoder
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EncoderConfig {
@@ -160,12 +157,16 @@ pub struct EncoderConfig {
 }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to the WS2812B-B RGB LEDs
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LedsConfig {
     /// Default brightness of the LEDs (0-255)
     pub brightness: u8,
+    /// Max brightness of the LEDs when powered only via USB (0-255)
+    pub max_brightness_unpowered: u8,
+    /// Max brightness of the LEDs when external power is connected (0-255)
+    pub max_brightness_powered: u8,
     /// Amount to change brightness when increasing or decreasing it
     pub step: u8,
     /// Total number of LEDs on or attached to the keyboard (70 plus however many you've connected)
@@ -176,7 +177,7 @@ pub struct LedsConfig {
 }
 
 // TODO: Make this more display-agnostic so it can work with anything
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to the MAX7219 displays/matrices
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DisplayConfig {
@@ -184,6 +185,8 @@ pub struct DisplayConfig {
     pub num_matrices: usize,
     /// Brightness (aka display intensity) (0-8)
     pub brightness: u8,
+    /// Max brightness overall (0-8)
+    pub max_brightness: u8,
     /// Maximum amount of characters we'll buffer (uses up RAM so don't make it too big)
     pub buffer_length: usize,
     /// If the display is upside down (0 or 1)
@@ -195,7 +198,7 @@ pub struct DisplayConfig {
 }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to mouse emulation
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InfraredConfig {
@@ -206,7 +209,7 @@ pub struct InfraredConfig {
 }
 }
 
-add_const_gen!{
+add_const_gen! {
 /// Configuration items related to development stuff
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DevConfig {

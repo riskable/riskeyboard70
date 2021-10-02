@@ -9,6 +9,7 @@
 protocol = "Swd"
 # The speed in kHz of the data link to the target.
 # speed = 1337
+#speed = 1100
 
 [default.flashing]
 # Whether or not the target should be flashed.
