@@ -1,8 +1,9 @@
 [keyboard]
+north_down = 1 # (1 or 0) If the magnets in your stems are north side down or south side down
 # How far (in millivolts) a key needs to move down before it's considered pressed
-actuation_threshold = 100 # 50-800 or so. Just a default (you can change it on-the-fly)
+actuation_threshold = 20 # 10-80 or so.
 # How far it needs to move back up before it's considered released
-release_threshold = 50 # 50-250 or so; Prevents bouncing
+release_threshold = 5 # 5-50 or so; Prevents bouncing by implementing some hysteresis
 # Number of analog multiplexers on this keyboard
 num_multiplexers = 5
 # Maximum number of channels on each multiplexer/remote control
@@ -11,16 +12,17 @@ max_channels = 21 # Multiplexers are always 16 but my remote has 21 buttons 🤷
 usb_vid = 0x16c0
 usb_pid = 0x27db
 # So we don't bother with disconnected pins, all mV values below this are ignored
-ignore_below = 600 # Probably leave this alone; just saves a smidge of CPU time
+ignore_below = 60 # Probably leave this alone; just saves a smidge of CPU time
 # Don't touch keyboard stuff below this point unless you know what you're doing
-update_defaults_rate = 1 # Updates per second
+recalibration_rate = 1 # How often to recalibrate all switches (seconds)
 
 # Rotary encoder settings (TODO: Figure out how to support multiple encoders)
 [encoder]
 # Controls how many mV either sensor needs to go up/down before we consider that a movement
-resolution = 240 # Valid values are 50-750-ish; below 200 or so can be annoying IMHO
+resolution = 50 # Valid values are 10-200-ish; 10 being insanely sensitive/fast and 200 being the opposite
+# FYI: 35 is a good high-speed-scrolling value
 # mV difference where we call it a Press()
-press_threshold = 600 # Must be greater than resolution
+press_threshold = 75 # Must be greater than resolution
 # The analog multiplexer where the encoder lives
 mux = 4
 # The channels on the analog multiplexer where the encoder sensors reside
@@ -28,6 +30,7 @@ channel1 = 8
 channel2 = 9
 # The virtual channel (doesn't actually exist) where we define encoder Press() events
 press_channel = 10
+# NOTE: Make sure it's under 16 and an unused multiplexer channel on the same 'mux'
 
 # Settings related to when we emulate a mouse (i.e. for scrolling with the rotary encoder)
 [mouse]
@@ -39,15 +42,18 @@ scroll_amount = 2
 # but if your keyboard is controlling external LEDs you'll need to factor that into
 # this number.
 num_leds = 150
-brightness = 30 # 0-255; for values over 30 you're going to need external power
-step = 5 # How much to move (±) when adjusting the LED brightness
+brightness = 40 # 0-255; for values over 30 you're going to need external power
+max_brightness_unpowered = 40 # 0-255; If you want to make sure you don't go over a certain brightness
+max_brightness_powered = 255 # 0-255; Maximum brightness when external 5V supply is connected
+step = 5 # How much to move (±) when adjusting the LED (and Display) brightness
 # speed = 15000000 # The speed at which LED effects move
 speed = 50 # The speed at which LED effects move
 
 [display]
 num_matrices = 8
-brightness = 1
-buffer_length = 50
+brightness = 1 # 0-8; FYI: MAX7129 brightness doesn't change much between lowest and highest
+max_brightness = 8 # 0-8
+buffer_length = 128 # Max message length
 refresh_interval = 15 # FPS
 vertical_flip = 1
 mirror = 0
