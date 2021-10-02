@@ -5,6 +5,9 @@ use std::fs;
 use std::path::Path;
 use core::include;
 
+// So we can use the date for the serial number
+use chrono::{DateTime, Utc};
+
 use toml;
 
 // A little hack so we can use our structs from config.rs without having to duplicate them here:
@@ -12,6 +15,9 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config_structs.rs"));
 // NOTE: config_structs.rs includes the serde import so we don't need it here
 
 fn main() {
+    let now: DateTime<Utc> = Utc::now();
+    // env::set_var("SERIALNOW", now.to_rfc3339()); // Used with the Riskeyboard firmware serial number
+    println!("cargo:rustc-env=SERIALNOW={}", now.timestamp()); // Used with the Riskeyboard firmware serial number
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("userconfig.rs");
     let mut out = String::new();
